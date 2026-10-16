@@ -1,0 +1,56 @@
+// Run with npm run test:desktop. Uses an isolated temporary account vault.
+const {_electron}=require('playwright-core');const assert=require('node:assert/strict');const fs=require('node:fs');const os=require('node:os');const path=require('node:path');
+(async()=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'tieba-desktop-test-'));let desktop;const requests=[];const server=require('node:http').createServer((request,response)=>{requests.push(request.url);let raw='';request.on('data',chunk=>raw+=chunk);request.on('end',()=>{const body=raw?JSON.parse(raw):{};response.setHeader('Content-Type','application/json');const data=request.url==='/browser/list'?{list:[{id:'test-window',name:'测试比特窗口',status:0},{id:'test-window-2',name:'第二个测试窗口',status:0}]}:request.url==='/group/list'?{list:[]}:request.url==='/browser/detail'?{id:body.id,name:body.id==='test-window'?'测试比特窗口':'第二个测试窗口',status:0,cookie:'[]'}:{};response.end(JSON.stringify({success:true,data}));});});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try{
+  desktop=await _electron.launch({args:[path.resolve(__dirname,'..')],env:{...process.env,TIEBA_DATA_DIR:directory},timeout:25000});
+  const page=await desktop.firstWindow();await page.waitForSelector('h1');
+  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  assert.equal(await page.getByText('无法打开本地加密账号库',{exact:false}).count(),0,'system keychain must be available');
+  await page.getByRole('button',{name:'＋ 添加账号',exact:true}).click();
+  await page.getByRole('dialog').getByRole('textbox',{name:'账号备注'}).fill('桌面测试账号');
+  await page.getByRole('dialog').getByRole('textbox',{name:'账号 CK',exact:true}).fill('BDUSS=SMOKE_TEST_ONLY;');
+  await page.getByRole('button',{name:'加密保存',exact:true}).click();
+  await page.locator('tbody tr').first().getByText('桌面测试账号',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('cell',{name:'已保存 · 未检测',exact:false}).count(),1);
+  const snapshot=await page.evaluate(async()=>window.client.state());assert.equal(snapshot.data.accounts.length,1);assert(!JSON.stringify(snapshot).includes('SMOKE_TEST_ONLY'));
+  await page.getByRole('button',{name:'批量导入',exact:true}).click();
+  await page.getByRole('dialog').locator('textarea').fill('BDUSS=SMOKE_TEST_ONLY;\ninvalid\n第二个----忽略----BDUSS=SMOKE_TEST_SECOND;');
+  await page.getByRole('button',{name:'开始逐条导入',exact:true}).click();
+  await page.getByText('成功 1 · 重复 1 · 失败 1',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('dialog').locator('textarea').inputValue(),'');
+  await page.getByRole('button',{name:'取消',exact:true}).click();
+  await page.getByRole('button',{name:'＋ 添加账号',exact:true}).click();
+  await page.getByRole('dialog').locator('textarea').fill('UNSAVED_SECRET');
+  await page.getByRole('button',{name:'取消',exact:true}).click();
+  await page.getByRole('button',{name:'＋ 添加账号',exact:true}).click();
+  assert.equal(await page.getByRole('dialog').locator('textarea').inputValue(),'');
+  await page.keyboard.press('Escape');
+  await page.getByRole('searchbox').fill('第二个');assert.equal(await page.locator('tbody tr').count(),1);await page.getByRole('searchbox').fill('');
+  await page.getByRole('textbox',{name:'本地 API 地址'}).fill(`http://127.0.0.1:${server.address().port}`);
+  await page.getByRole('button',{name:'连接比特浏览器',exact:true}).click();await page.getByText('已连接',{exact:true}).waitFor();
+  await page.locator('tbody tr').first().getByRole('button',{name:'创建 / 绑定',exact:true}).click();await page.getByRole('dialog').getByRole('combobox').selectOption('test-window');await page.getByRole('button',{name:'确认绑定',exact:true}).click();await page.getByRole('cell',{name:'测试比特窗口',exact:false}).waitFor();
+  await page.getByRole('button',{name:'导入到窗口',exact:true}).click();assert.equal(await page.getByRole('button',{name:'确认替换并导入',exact:true}).isDisabled(),true);await page.getByRole('button',{name:'取消',exact:true}).click();assert(!requests.includes('/browser/update/partial'));
+  await page.getByRole('checkbox',{name:'选择当前页',exact:true}).check();
+  await page.getByRole('combobox',{name:'选择批量操作',exact:true}).selectOption('close');
+  await page.getByRole('button',{name:'开始批量执行',exact:true}).click();
+  await page.locator('.batch-summary').filter({hasText:'成功 1 · 失败 0 · 跳过 1'}).waitFor();
+  await page.getByRole('combobox',{name:'选择批量操作',exact:true}).selectOption('unbind');
+  assert(await page.getByRole('button',{name:'开始批量执行',exact:true}).isDisabled());await page.getByRole('dialog').getByRole('checkbox').check();await page.getByRole('button',{name:'开始批量执行',exact:true}).click();
+  await page.locator('.batch-report').getByText('任务已结束',{exact:true}).waitFor();
+  await page.getByRole('combobox',{name:'选择批量操作',exact:true}).selectOption('bind');
+  await page.getByRole('button',{name:'按空闲窗口顺序分配（需核对）',exact:true}).click();assert.equal(await page.getByRole('dialog').getByRole('combobox').count(),2);
+  await page.getByRole('dialog').getByRole('checkbox').check();await page.getByRole('button',{name:'开始批量执行',exact:true}).click();await page.locator('.batch-summary').filter({hasText:'成功 2 · 失败 0'}).waitFor();
+  assert(!requests.includes('/browser/update/partial'),'batch binding must never write cookies');
+  await page.locator('.batch-report').getByText('任务已结束',{exact:true}).waitFor();
+  const paginationImport=await page.evaluate(async()=>window.client.importText(Array.from({length:60},(_,i)=>`BDUSS=PAGINATION_TEST_${i};`).join('\n')));assert.equal(paginationImport.ok,true);
+  await page.waitForFunction(()=>document.querySelectorAll('tbody tr').length===50);await page.getByRole('button',{name:'下一页',exact:true}).click();assert.equal(await page.locator('tbody tr').count(),12);await page.getByRole('button',{name:'上一页',exact:true}).click();
+  await page.screenshot({path:path.join(os.tmpdir(),'tieba-desktop-preview.png'),fullPage:true});
+  await desktop.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(1000,740));
+  await page.waitForTimeout(200);
+  const geometry=await page.locator('.table-wrap').evaluate(el=>({width:el.clientWidth,scroll:el.scrollWidth}));assert(geometry.scroll<=geometry.width+1,`table should fit minimum window: ${JSON.stringify(geometry)}`);
+  await page.screenshot({path:path.join(os.tmpdir(),'tieba-desktop-narrow.png'),fullPage:true});
+  assert.deepEqual(errors,[]);const disk=fs.readFileSync(path.join(directory,'account-vault','accounts.json'),'utf8');assert(!disk.includes('SMOKE_TEST_ONLY'));
+  console.log('Desktop smoke passed: encrypted save, batch results, clear-on-close, search, HTTP connection, binding without writing, replacement confirmation, batch close, batch unbind/bind confirmation, 62-account pagination, minimum window layout.');
+ }finally{if(desktop)await desktop.close();await new Promise(resolve=>server.close(resolve));fs.rmSync(directory,{recursive:true,force:true});}
+})().catch(error=>{console.error(error.message);process.exitCode=1;});
